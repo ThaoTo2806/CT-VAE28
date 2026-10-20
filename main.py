@@ -131,7 +131,7 @@ class CTVGAE:
         self.v = 1.0
         self.batch_weight = math.ceil(self.batch / self.edge_num)
 
-        self.loss = torch.FloatTensor()
+        self.loss = torch.tensor(0.0, device=device)
 
         self.pi = nn.Parameter(torch.ones(self.clusters) / self.clusters, requires_grad=True)#.to(device)
         self.mu_c = nn.Parameter(torch.randn(self.clusters, self.feature.shape[1]), requires_grad=True)#.to(device)
@@ -147,7 +147,7 @@ class CTVGAE:
         print("init gmm > acc:{}, nmi:{}, ari:{}, f1:{}".format(acc, nmi, ari, f1))
 
         self.pseudo_lable = init_pred
-        self.pseudo_lable = torch.from_numpy(init_pred)
+        self.pseudo_lable = torch.from_numpy(init_pred.copy())
 
         self.assignment = ClusterAssignment(self.clusters, self.feature.shape[1], 1, torch.from_numpy(kmeans.cluster_centers_)).to(device)
         self.loss_kl = nn.KLDivLoss(reduction='batchmean')
@@ -189,15 +189,17 @@ class CTVGAE:
     def kl_loss(self, z, p):
         q = 1.0 / (1.0 + torch.sum(torch.pow(z.unsqueeze(1) - self.cluster_layer, 2), 2) / self.v)
         q = q.pow((self.v + 1.0) / 2.0)
-        q = (q.t() / torch.sum(q, 1)).t()
+        q = (q.t() / torch.sum(q, 1).clamp_min(1e-12)).t()
+        q = q.clamp_min(1e-12)
 
-        the_kl_loss = F.kl_div((q.log()), p, reduction='batchmean')  # l_clu
+        the_kl_loss = F.kl_div((q.log()), p.clamp_min(1e-12), reduction='batchmean')  # l_clu
         return the_kl_loss
 
     def target_dis(self, emb):
         q = 1.0 / (1.0 + torch.sum(torch.pow(emb.unsqueeze(1) - self.cluster_layer, 2), 2) / self.v)
         q = q.pow((self.v + 1.0) / 2.0)
-        q = (q.t() / torch.sum(q, 1)).t()
+        q = (q.t() / torch.sum(q, 1).clamp_min(1e-12)).t()
+        q = q.clamp_min(1e-12)
 
         return q
 
@@ -210,13 +212,14 @@ class CTVGAE:
         s_pre_emb = self.pre_emb.index_select(0, Variable(s_nodes.view(-1))).view(batch, -1)
 
         # CT-CAVAE
-        pi = self.pi
+        pi = self.pi.clamp_min(1e-12)
         mean_c = self.mu_c
         logstd_c = self.log_sigma2_c
         p_c_z = self.assignment(s_node_emb)
+        p_c_z = p_c_z.clamp_min(1e-12)
         q_c_xa = torch.exp(torch.log(pi.unsqueeze(0)) + self._gaussian_pdfs_log(s_node_emb, mean_c, logstd_c).to(torch.float64)) + 1e-2
-        q_c_xa = q_c_xa / (q_c_xa.sum(1).view(-1, 1))
-        q_c_xa = q_c_xa.to(torch.float32)
+        q_c_xa = q_c_xa / (q_c_xa.sum(1).view(-1, 1).clamp_min(1e-12))
+        q_c_xa = q_c_xa.to(torch.float32).clamp_min(1e-12)
         loss_clus = self.loss_kl(p_c_z, q_c_xa)
         ####
 
@@ -231,22 +234,23 @@ class CTVGAE:
 
 
         pseudo = torch.zeros(size=[batch, self.clusters]).to(torch.float32).to(device)
-        pseudo[np.arange(batch), self.pseudo_lable[s_nodes]] = 1
-        pseudo[np.arange(batch), self.pseudo_lable[t_nodes]] = 1
+        pseudo_labels = self.pseudo_lable.to(s_nodes.device)
+        pseudo[torch.arange(batch, device=device), pseudo_labels[s_nodes]] = 1
+        pseudo[torch.arange(batch, device=device), pseudo_labels[t_nodes]] = 1
         pseudo_s_t = pseudo @ pseudo.T
         pseudo[:] = 0
         if self.hist_len > 1:
             pseudo_s_h = torch.zeros(size=[self.hist_len, batch, batch])
             for hist_idx in range(self.hist_len):
-                pseudo[torch.arange(batch), self.pseudo_lable[s_nodes]] = 1
-                pseudo[torch.arange(batch), self.pseudo_lable[h_nodes[:,hist_idx]]] = 1
+                pseudo[torch.arange(batch, device=device), pseudo_labels[s_nodes]] = 1
+                pseudo[torch.arange(batch, device=device), pseudo_labels[h_nodes[:,hist_idx]]] = 1
                 aux_pseudo = pseudo @ pseudo.T
                 aux_pseudo = aux_pseudo * h_time_mask[:,0]
                 pseudo_s_h[hist_idx, :, :] = aux_pseudo
             pseudo[:] = 0
         else:
-            pseudo[torch.arange(batch), self.pseudo_lable[s_nodes]] = 1
-            pseudo[torch.arange(batch), self.pseudo_lable[h_nodes]] = 1
+            pseudo[torch.arange(batch, device=device), pseudo_labels[s_nodes]] = 1
+            pseudo[torch.arange(batch, device=device), pseudo_labels[h_nodes]] = 1
             pseudo_s_h = pseudo @ pseudo.T
             pseudo_s_h = pseudo_s_h * h_time_mask
         ################################
@@ -291,31 +295,87 @@ class CTVGAE:
         n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * (torch.exp(delta * Variable(d_time)).unsqueeze(2)) * (
             Variable(h_time_mask).unsqueeze(2))).sum(dim=1)
 
-        loss = -torch.log(p_lambda.sigmoid() + 1e-6) - torch.log(n_lambda.neg().sigmoid() + 1e-6).sum(dim=1)
+        p_lambda = p_lambda.clamp(min=-20.0, max=20.0)
+        n_lambda = n_lambda.clamp(min=-20.0, max=20.0)
+        loss = -F.logsigmoid(p_lambda) - F.logsigmoid(-n_lambda).sum(dim=1)
 
         total_loss = loss.sum() + l_framework - loss_clus
 
         return total_loss
 
     def update(self, s_nodes, t_nodes, t_times, n_nodes, h_nodes, h_times, h_time_mask):
-        if torch.cuda.is_available():
-            with torch.cuda.device(DID):
-                self.opt.zero_grad()
-                loss = self.forward(s_nodes, t_nodes, t_times, n_nodes, h_nodes, h_times, h_time_mask)
-                self.loss += loss.data
-                loss.backward()
-                self.opt.step()
-        else:
-            self.opt.zero_grad()
-            loss = self.forward(s_nodes, t_nodes, t_times, n_nodes, h_nodes, h_times, h_time_mask)
-            self.loss += loss.data
-            loss.backward()
-            self.opt.step()
+        self.opt.zero_grad()
+
+        loss = self.forward(
+            s_nodes, t_nodes, t_times, n_nodes,
+            h_nodes, h_times, h_time_mask
+        )
+
+        # Dừng trước backward nếu loss đã không hữu hạn
+        if not torch.isfinite(loss).all():
+            print("\\n[NaN-DIAG] Loss không hữu hạn trước backward.")
+            print("loss =", loss.detach().item())
+            print("delta finite =", bool(torch.isfinite(self.delta).all()))
+            print("delta min/max =",
+                  self.delta.detach().min().item(),
+                  self.delta.detach().max().item())
+            raise FloatingPointError("Non-finite loss; optimizer.step() chưa được gọi.")
+
+        loss.backward()
+
+        # Kiểm tra gradient trước optimizer.step()
+        bad_grads = []
+        for name, param in [
+            ("node_emb", self.node_emb),
+            ("delta", self.delta),
+            ("cluster_layer", self.cluster_layer),
+            ("pi", self.pi),
+            ("mu_c", self.mu_c),
+            ("log_sigma2_c", self.log_sigma2_c),
+            ("assignment.cluster_centers", self.assignment.cluster_centers),
+        ]:
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                bad_grads.append(name)
+
+        if bad_grads:
+            print("\\n[NaN-DIAG] Gradient không hữu hạn:", bad_grads)
+            print("delta min/max =",
+                  self.delta.detach().min().item(),
+                  self.delta.detach().max().item())
+            raise FloatingPointError(
+                "Non-finite gradients; optimizer.step() chưa được gọi."
+            )
+
+        self.loss += loss.detach()
+        self.opt.step()
+
+        # Kiểm tra tham số sau cập nhật
+        params = [
+            ("node_emb", self.node_emb),
+            ("delta", self.delta),
+            ("cluster_layer", self.cluster_layer),
+            ("pi", self.pi),
+            ("mu_c", self.mu_c),
+            ("log_sigma2_c", self.log_sigma2_c),
+            ("assignment.cluster_centers", self.assignment.cluster_centers),
+        ]
+        bad_params = [
+            name for name, param in params
+            if not torch.isfinite(param).all()
+        ]
+
+        if bad_params:
+            print("\\n[NaN-DIAG] Tham số không hữu hạn sau optimizer.step():", bad_params)
+            print("delta min/max =",
+                  self.delta.detach().min().item(),
+                  self.delta.detach().max().item())
+            raise FloatingPointError("Optimizer tạo tham số không hữu hạn.")
+
 
     def train(self):
         for epoch in range(self.epochs):
-            self.loss = 0.0
-            loader = DataLoader(self.data, batch_size=self.batch, shuffle=True, num_workers=1)
+            self.loss = torch.tensor(0.0, device=device)
+            loader = DataLoader(self.data, batch_size=self.batch, shuffle=True, num_workers=0)
             for i_batch, sample_batched in enumerate(loader):
                 if i_batch != 0:
                     sys.stdout.write('\r' + str(i_batch * self.batch) + '\tloss: ' + str(
@@ -334,7 +394,7 @@ class CTVGAE:
                 acc, nmi, ari, f1 = 0, 0, 0, 0
             else:
                 pred, _ = self.predict(self.node_emb)
-                self.pseudo_lable = torch.from_numpy(pred)
+                self.pseudo_lable = torch.from_numpy(pred.copy())
                 acc, nmi, ari, f1 = end2end_eva(self.labels, pred)
                 # acc, nmi, ari, f1 = 0, 0, 0, 0
                 k_means_acc, k_means_nmi, k_means_ari, k_means_f1 = eva(self.clusters, self.labels, self.node_emb.cpu())

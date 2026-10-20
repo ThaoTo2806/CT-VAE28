@@ -7,56 +7,59 @@ from sklearn.cluster import KMeans
 from sklearn.datasets import load_iris
 
 def evaluation(y_true, y_pred):
-    """
-    evaluate the clustering performance
-    :param y_true: ground truth
-    :param y_pred: prediction
-    :returns acc, nmi, ari, f1:
-    - accuracy
-    - normalized mutual information
-    - adjust rand index
-    - f1 score
-    """
-    nmi = nmi_score(y_true, y_pred, average_method='arithmetic')
-    ari = ari_score(y_true, y_pred)
+    """Evaluate clustering with Hungarian matching, including missing clusters."""
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+    from sklearn.metrics import accuracy_score, f1_score
+    from sklearn.metrics.cluster import normalized_mutual_info_score
+    from sklearn.metrics import adjusted_rand_score
 
-    y_true = y_true - np.min(y_true)
-    l1 = list(set(y_true))
-    num_class1 = len(l1)
-    l2 = list(set(y_pred))
-    num_class2 = len(l2)
-    ind = 0
-    if num_class1 != num_class2:
-        for i in l1:
-            if i in l2:
-                pass
-            else:
-                y_pred[ind] = i
-                ind += 1
-    l2 = list(set(y_pred))
-    num_class2 = len(l2)
-    if num_class1 != num_class2:
-        print('error')
-        return 0, nmi, ari, 0
-    cost = np.zeros((num_class1, num_class2), dtype=int)
-    for i, c1 in enumerate(l1):
-        mps = [i1 for i1, e1 in enumerate(y_true) if e1 == c1]
-        for j, c2 in enumerate(l2):
-            mps_d = [i1 for i1 in mps if y_pred[i1] == c2]
-            cost[i][j] = len(mps_d)
-    m = Munkres()
-    cost = cost.__neg__().tolist()
-    indexes = m.compute(cost)
-    new_predict = np.zeros(len(y_pred))
-    for i, c in enumerate(l1):
-        c2 = l2[indexes[i][1]]
-        ai = [ind for ind, elm in enumerate(y_pred) if elm == c2]
-        new_predict[ai] = c
-    acc = accuracy_score(y_true, new_predict)
-    f1 = f1_score(y_true, new_predict, average='macro')
+    y_true = np.asarray(y_true).reshape(-1).copy()
+    y_pred = np.asarray(y_pred).reshape(-1).copy()
 
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true and y_pred must have equal lengths")
+    if len(y_true) == 0:
+        raise ValueError("Empty labels")
+
+    true_classes = np.unique(y_true)
+    pred_classes = np.unique(y_pred)
+
+    nmi = normalized_mutual_info_score(
+        y_true, y_pred, average_method="arithmetic"
+    )
+    ari = adjusted_rand_score(y_true, y_pred)
+
+    # Contingency matrix: rows = true classes, columns = predicted clusters
+    contingency = np.zeros(
+        (len(true_classes), len(pred_classes)), dtype=np.int64
+    )
+    for i, true_label in enumerate(true_classes):
+        for j, pred_label in enumerate(pred_classes):
+            contingency[i, j] = np.sum(
+                (y_true == true_label) & (y_pred == pred_label)
+            )
+
+    row_ind, col_ind = linear_sum_assignment(-contingency)
+
+    # Map matched clusters to true labels; unmatched clusters remain distinct.
+    mapped = np.full(y_pred.shape, fill_value=None, dtype=object)
+    mapping = {
+        pred_classes[col]: true_classes[row]
+        for row, col in zip(row_ind, col_ind)
+    }
+    for pred_label in pred_classes:
+        mapped[y_pred == pred_label] = mapping.get(pred_label, "__unmatched__")
+
+    acc = accuracy_score(y_true.astype(str), mapped.astype(str))
+    f1 = f1_score(
+        y_true.astype(str),
+        mapped.astype(str),
+        labels=true_classes.astype(str),
+        average="macro",
+        zero_division=0,
+    )
     return acc, nmi, ari, f1
-
 
 def eva(k, labels, emb):
     embeddings = emb.cpu().data.numpy()
